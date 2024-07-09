@@ -379,7 +379,7 @@ for step in range(max_steps):
 
     # once in a while evaluate our validation loss
     if step % 250 == 0 or last_step:
-        model.eval()
+        raw_model.eval()
         val_loader.reset()
         with torch.no_grad():
             val_loss_accum = 0.0
@@ -388,7 +388,7 @@ for step in range(max_steps):
                 x, y = val_loader.next_batch()
                 x, y = x.to(device), y.to(device)
                 with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, loss = model(x, y)
+                    logits, loss = raw_model(x, y)
                 loss = loss / val_loss_steps
                 val_loss_accum += loss.detach()
         if ddp:
@@ -425,7 +425,7 @@ for step in range(max_steps):
             # get the logits
             with torch.no_grad():
                 with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, loss = model(tokens)
+                    logits, loss = raw_model(tokens)
                 pred_norm = get_most_likely_row(tokens, mask, logits)
             num_total += 1
             num_correct_norm += int(pred_norm == label)
@@ -445,7 +445,7 @@ for step in range(max_steps):
 
     # once in a while generate from the model (except step 0, which is noise)
     if ((step > 0 and step % 250 == 0) or last_step) and (not use_compile):
-        model.eval()
+        raw_model.eval()
         num_return_sequences = 4
         max_length = 32
         tokens = enc.encode("Hello, I'm a language model,")
@@ -458,7 +458,7 @@ for step in range(max_steps):
             # forward the model to get the logits
             with torch.no_grad():
                 with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, loss = model(xgen) # (B, T, vocab_size)
+                    logits, loss = raw_model(xgen) # (B, T, vocab_size)
                 # take the logits at the last position
                 logits = logits[:, -1, :] # (B, vocab_size)
                 # get the probabilities
@@ -480,7 +480,7 @@ for step in range(max_steps):
             print(f"rank {ddp_rank} sample {i}: {decoded}")
 
     # do one step of the optimization
-    model.train()
+    raw_model.train()
     optimizer.zero_grad()
     loss_accum = 0.0
     for micro_step in range(grad_accum_steps):
@@ -488,9 +488,9 @@ for step in range(max_steps):
         x, y = x.to(device), y.to(device)
         # added after video, this field is also used by the forward pass.
         if ddp:
-            model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
+            raw_model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
         with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-            logits, loss = model(x, y)
+            logits, loss = raw_model(x, y)
         # we have to scale the loss to account for gradient accumulation,
         # because the gradients just add on each successive backward().
         # addition of gradients corresponds to a SUM in the objective, but
@@ -500,7 +500,7 @@ for step in range(max_steps):
         loss.backward()
     if ddp:
         dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
-    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    norm = torch.nn.utils.clip_grad_norm_(raw_model.parameters(), 1.0)
     # determine and set the learning rate for this iteration
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
