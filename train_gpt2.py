@@ -339,9 +339,12 @@ torch.set_float32_matmul_precision('high')
 model = GPT(GPTConfig(vocab_size=50304))
 # model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
 model.to(device)
+
 use_compile = False # torch.compile interferes with HellaSwag eval and Generation. TODO fix
+compile_mode = "default" # choose from "default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs" src: https://pytorch.org/docs/stable/generated/torch.compile.html
+
 if use_compile:
-    model = torch.compile(model)
+    model = torch.compile(model, mode=compile_mode)
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
