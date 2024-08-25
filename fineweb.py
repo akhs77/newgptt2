@@ -69,11 +69,14 @@ with mp.Pool(nprocs) as pool:
             progress_bar.update(remainder)
             all_tokens_np[token_count:token_count+remainder] = tokens[:remainder]
             write_datafile(filename, all_tokens_np)
+            progress_bar.close() # close the progress bar for this shard
+            # start a new shard
             shard_index += 1
-            progress_bar = None
             # populate the next shard with the leftovers of the current doc
             all_tokens_np[0:len(tokens)-remainder] = tokens[remainder:]
             token_count = len(tokens)-remainder
+            progress_bar = tqdm(total=shard_size, unit="tokens", desc=f"Shard {shard_index}")
+            progress_bar.update(token_count)
 
     # write any remaining tokens as the last shard
     if token_count != 0:
