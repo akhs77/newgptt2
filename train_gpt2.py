@@ -473,6 +473,11 @@ for step in range(max_steps):
                 xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
                 # append to the sequence
                 xgen = torch.cat((xgen, xcol), dim=1)
+
+        # The model may generate a token id that is out of bounds, making tiktoken panic
+        # in decode(..). A quick fix is to replace them with the EOT.
+        xgen[xgen > enc.max_token_value] = enc.eot_token
+
         # print the generated text
         for i in range(num_return_sequences):
             tokens = xgen[i, :max_length].tolist()
