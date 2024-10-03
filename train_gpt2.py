@@ -237,6 +237,17 @@ class DataLoaderLite:
         self.tokens = load_tokens(self.shards[self.current_shard])
         self.current_position = self.B * self.T * self.process_rank
 
+    # set the data loader to a specific state (from a checkpoint)
+    def set(self, loader_checkpoint):
+        self.current_position = loader_checkpoint['current_position'] + self.B * self.T * self.process_rank # we add the B*T*process_rank to the position to make sure it is the correct position for each process
+        self.current_shard = loader_checkpoint['current_shard']
+        self.tokens = load_tokens(self.shards[self.current_shard]) 
+        # if loading the next batch will exceed the tokens, reset the position and load the next shard
+        if self.current_position + (B * T * self.num_processes + 1) >= len(self.tokens):
+            self.current_shard = (self.current_shard + 1) % len(self.shards)
+            self.tokens = load_tokens(self.shards[self.current_shard])
+            self.current_position = self.B * self.T * self.process_rank
+    
     def next_batch(self):
         B, T = self.B, self.T
         buf = self.tokens[self.current_position : self.current_position+B*T+1]
@@ -335,10 +346,50 @@ val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_w
 
 torch.set_float32_matmul_precision('high')
 
-# create model
-model = GPT(GPTConfig(vocab_size=50304))
-# model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
-model.to(device)
+
+# create the log directory we will write checkpoints to and log to
+log_dir = "log"
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f"log.txt")
+
+# Start or Resume training
+resume_training = False
+if resume_training:
+    # get the latest checkpoint file
+    checkpoint_files = [f for f in os.listdir(log_dir) if f.startswith("model_") and f.endswith(".pt")]
+    assert len(checkpoint_files) > 0, "no checkpoints found to resume training from"
+    checkpoint_files = sorted(checkpoint_files)
+    checkpoint_file = checkpoint_files[-1]
+    checkpoint_path = os.path.join(log_dir, checkpoint_file)
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    # load the model state
+    model = GPT(checkpoint['config'])
+    model.to(device)
+    model.load_state_dict(checkpoint['model'])
+    # load the optimizer state
+    optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
+    optimizer.load_state_dict(checkpoint['optimizer'])
+    # load the step (which will determine the learning rate in the scheduler)
+    current_step = checkpoint['step'] + 1
+    # load the training data loader state
+    train_loader.set(checkpoint['train_loader'])
+    if master_process:
+        print(f"resuming training from step {current_step} with a validation loss of {checkpoint['val_loss']:.4f}")
+else:
+    # create model
+    model = GPT(GPTConfig(vocab_size=50304))
+    # model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
+    model.to(device)
+    current_step = 0
+    # optimize!
+    optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
+    # clear the log file
+    with open(log_file, "w") as f: # open for writing to clear the file
+        pass
+
+
+
+
 use_compile = False # torch.compile interferes with HellaSwag eval and Generation. TODO fix
 if use_compile:
     model = torch.compile(model)
@@ -363,17 +414,11 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
     return min_lr + coeff * (max_lr - min_lr)
 
-# optimize!
-optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
 
-# create the log directory we will write checkpoints to and log to
-log_dir = "log"
-os.makedirs(log_dir, exist_ok=True)
-log_file = os.path.join(log_dir, f"log.txt")
-with open(log_file, "w") as f: # open for writing to clear the file
-    pass
 
-for step in range(max_steps):
+
+
+for step in range(current_step,max_steps):
     t0 = time.time()
     last_step = (step == max_steps - 1)
 
@@ -399,15 +444,16 @@ for step in range(max_steps):
                 f.write(f"{step} val {val_loss_accum.item():.4f}\n")
             if step > 0 and (step % 5000 == 0 or last_step):
                 # optionally write model checkpoints
+                train_loader_checkpoint = {'current_shard': train_loader.current_shard, 'current_position': train_loader.current_position}
                 checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
                 checkpoint = {
                     'model': raw_model.state_dict(),
                     'config': raw_model.config,
                     'step': step,
-                    'val_loss': val_loss_accum.item()
+                    'val_loss': val_loss_accum.item(),
+                    'train_loader': train_loader_checkpoint,
+                    'optimizer': optimizer.state_dict(),
                 }
-                # you might also want to add optimizer.state_dict() and
-                # rng seeds etc., if you wanted to more exactly resume training
                 torch.save(checkpoint, checkpoint_path)
 
     # once in a while evaluate hellaswag
